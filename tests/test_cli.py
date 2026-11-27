@@ -220,5 +220,82 @@ class CliDialectBehaviorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
 
 
+class CliMaxSqlLengthTest(unittest.TestCase):
+    def test_valid_max_sql_length_safe_and_unsafe(self):
+        safe_result = run_cli(["audit", "-", "--max-sql-length", "16"], b"SELECT 1")
+        self.assertEqual(safe_result.returncode, 0)
+        self.assertIn(b"safe", safe_result.stdout)
+
+        unsafe_result = run_cli(["audit", "-", "--max-sql-length", "5"], b"SELECT 1")
+        self.assertEqual(unsafe_result.returncode, 1)
+        self.assertIn(b"PYSQLCAGE_MAX_SQL_LENGTH", unsafe_result.stdout)
+
+    def test_boundary_values_min_and_max(self):
+        min_safe = run_cli(["audit", "-", "--max-sql-length", "1"], b"1")
+        self.assertEqual(min_safe.returncode, 0)
+
+        min_unsafe = run_cli(["audit", "-", "--max-sql-length", "1"], b"12")
+        self.assertEqual(min_unsafe.returncode, 1)
+        self.assertIn(b"PYSQLCAGE_MAX_SQL_LENGTH", min_unsafe.stdout)
+
+        max_safe = run_cli(["audit", "-", "--max-sql-length", "16777216"], b"SELECT 1")
+        self.assertEqual(max_safe.returncode, 0)
+
+    def test_zero_rejected_with_exit_two(self):
+        result = run_cli(["audit", "-", "--max-sql-length", "0"], b"SELECT 1")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"error", result.stderr)
+
+    def test_negative_rejected_with_exit_two(self):
+        for flag in ("--max-sql-length=-1", "--max-sql-length=-100"):
+            result = run_cli(["audit", "-", flag], b"SELECT 1")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"error", result.stderr)
+
+    def test_boolean_like_rejected_with_exit_two(self):
+        for raw in ("true", "True", "false", "False"):
+            result = run_cli(["audit", "-", "--max-sql-length", raw], b"SELECT 1")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"error", result.stderr)
+
+    def test_oversized_rejected_with_exit_two(self):
+        for raw in ("16777217", "999999999999"):
+            result = run_cli(["audit", "-", "--max-sql-length", raw], b"SELECT 1")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"error", result.stderr)
+
+    def test_control_characters_neutralized_in_error(self):
+        ansi_result = run_cli(["audit", "-", "--max-sql-length", "10\x1b[31m"], b"SELECT 1")
+        self.assertEqual(ansi_result.returncode, 2)
+        self.assertNotIn(b"\x1b", ansi_result.stderr)
+        self.assertIn(b"\\x1b", ansi_result.stderr)
+
+        bidi_result = run_cli(["audit", "-", "--max-sql-length", "10\u202e"], b"SELECT 1")
+        self.assertEqual(bidi_result.returncode, 2)
+        self.assertNotIn("\u202e".encode("utf-8"), bidi_result.stderr)
+        self.assertIn(b"\\u202e", bidi_result.stderr)
+
+        newline_result = run_cli(["audit", "-", "--max-sql-length", "10\ninjected"], b"SELECT 1")
+        self.assertEqual(newline_result.returncode, 2)
+        self.assertEqual(len(newline_result.stderr.splitlines()), 1)
+        self.assertIn(b"\\n", newline_result.stderr)
+
+    def test_json_output_reflects_max_sql_length_threshold(self):
+        query = b"SELECT 1"
+        safe_result = run_cli(["audit", "-", "--max-sql-length", "8", "--json"], query)
+        self.assertEqual(safe_result.returncode, 0)
+        safe_payload = json.loads(safe_result.stdout.decode("utf-8"))
+        self.assertTrue(safe_payload["safe"])
+        self.assertEqual(safe_payload["findings"], [])
+
+        unsafe_result = run_cli(["audit", "-", "--max-sql-length", "7", "--json"], query)
+        self.assertEqual(unsafe_result.returncode, 1)
+        unsafe_payload = json.loads(unsafe_result.stdout.decode("utf-8"))
+        self.assertFalse(unsafe_payload["safe"])
+        self.assertEqual(len(unsafe_payload["findings"]), 1)
+        self.assertEqual(unsafe_payload["findings"][0]["code"], "PYSQLCAGE_MAX_SQL_LENGTH")
+        self.assertEqual(unsafe_payload["findings"][0]["index"], 7)
+
+
 if __name__ == "__main__":
     unittest.main()

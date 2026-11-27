@@ -171,7 +171,7 @@ name_filter = sql_like("name", "100%_literal", dialect="postgres", mode="contain
 Audit a file:
 
 ```bash
-pysqlcage audit query.sql --dialect postgres --json
+pysqlcage audit query.sql --dialect postgres --max-sql-length 65536 --json
 ```
 
 Audit standard input:
@@ -179,6 +179,8 @@ Audit standard input:
 ```bash
 printf 'SELECT 1; DROP TABLE users\n' | python3 -m pysqlcage audit - --dialect sqlite
 ```
+
+`--max-sql-length` accepts an exact integer between `1` and `16777216` (default `65536`) and controls the threshold for `PYSQLCAGE_MAX_SQL_LENGTH` findings.
 
 Exit status is `0` when no findings are present, `1` when the SQL is unsafe, and `2` for input or operational errors. File input is opened with symlink, file-type, race, size, encoding, and control-character defenses.
 

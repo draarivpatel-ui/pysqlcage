@@ -9,7 +9,7 @@ import unicodedata
 from typing import Any, Optional, Sequence, Tuple
 
 from .audit import audit_sql_query
-from .constants import PYSQLCAGE_VERSION
+from .constants import DEFAULT_MAX_SQL_LENGTH, MAX_AUDIT_INPUT_LENGTH, PYSQLCAGE_VERSION
 from .errors import SqlCageError
 
 MAX_INPUT_BYTES = 1048576
@@ -117,6 +117,25 @@ def _read_input(path: str) -> Tuple[str, str]:
         raise _InputError("input " + _neutralize(label) + " is not valid UTF-8: " + _neutralize(exc))
 
 
+def _parse_max_sql_length(raw: str) -> int:
+    if not raw or not raw.isascii() or not raw.isdigit():
+        raise _InputError(
+            "invalid --max-sql-length value "
+            + _neutralize(raw)
+            + ": must be an integer between 1 and "
+            + str(MAX_AUDIT_INPUT_LENGTH)
+        )
+    value = int(raw, 10)
+    if value < 1 or value > MAX_AUDIT_INPUT_LENGTH:
+        raise _InputError(
+            "invalid --max-sql-length value "
+            + _neutralize(raw)
+            + ": must be an integer between 1 and "
+            + str(MAX_AUDIT_INPUT_LENGTH)
+        )
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _NeutralizingArgumentParser(
         prog="pysqlcage",
@@ -127,6 +146,15 @@ def _parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("audit", help="audit one SQL file or standard input")
     audit.add_argument("input", help="SQL file path, or - for standard input")
     audit.add_argument("--dialect", choices=("postgres", "mysql", "sqlite"), default="postgres")
+    audit.add_argument(
+        "--max-sql-length",
+        default=None,
+        help="maximum SQL character length before reporting PYSQLCAGE_MAX_SQL_LENGTH (1 to "
+        + str(MAX_AUDIT_INPUT_LENGTH)
+        + ", default "
+        + str(DEFAULT_MAX_SQL_LENGTH)
+        + ")",
+    )
     audit.add_argument("--json", action="store_true", help="write machine-readable JSON")
     return parser
 
@@ -136,8 +164,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "audit":
         try:
+            max_sql_length = (
+                DEFAULT_MAX_SQL_LENGTH
+                if args.max_sql_length is None
+                else _parse_max_sql_length(args.max_sql_length)
+            )
             query, label = _read_input(args.input)
-            result = audit_sql_query(query, dialect=args.dialect)
+            result = audit_sql_query(query, dialect=args.dialect, max_sql_length=max_sql_length)
         except (_InputError, SqlCageError) as exc:
             print("pysqlcage: error: " + _neutralize(exc), file=sys.stderr)
             return 2
