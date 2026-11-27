@@ -189,7 +189,7 @@ class RepositoryHygieneTest(unittest.TestCase):
         self.assertIn("id-token: write", data)
         self.assertIn("environment:", data)
         self.assertIn("name: pypi", data)
-        self.assertIn("pypa/gh-action-pypi-publish@release/v1", data)
+        self.assertIn("pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086", data)
         self.assertNotIn("PYPI" + "_TOKEN", data)
         self.assertNotIn("password:", data)
 
