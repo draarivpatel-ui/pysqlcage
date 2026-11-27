@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -166,16 +167,23 @@ def audit_sql_query(query: Any, *, dialect: Any = None, max_sql_length: Any = DE
     if len(query) > max_sql_length:
         add_finding(CODE["MAX_SQL_LENGTH"], "SQL length exceeds max_sql_length (" + str(max_sql_length) + ")", max_sql_length)
 
-    nul_indexes = [index for index, character in enumerate(query) if character == "\x00"]
-    if nul_indexes:
-        stats["nul_bytes"] = len(nul_indexes)
-        add_finding(CODE["NUL_BYTE"], "SQL contains a NUL byte", nul_indexes[0])
+    nul_count = 0
+    first_nul_index = -1
+    for character_index, character in enumerate(query):
+        if character == "\x00":
+            nul_count += 1
+            if first_nul_index == -1:
+                first_nul_index = character_index
+    if nul_count:
+        stats["nul_bytes"] = nul_count
+        add_finding(CODE["NUL_BYTE"], "SQL contains a NUL byte", first_nul_index)
 
     index = 0
     state = "normal"
     quote_start = -1
     quote_kind = ""
     quote_backslash_escapes = False
+    mysql_ambiguous_escape_reported = False
     dollar_delimiter = ""
     block_comment_depth = 0
     block_comment_start = -1
@@ -213,6 +221,19 @@ def audit_sql_query(query: Any, *, dialect: Any = None, max_sql_length: Any = DE
         if state in ("single", "double", "backtick"):
             quote = "'" if state == "single" else ('"' if state == "double" else "`")
             if quote_backslash_escapes and character == "\\":
+                if (
+                    selected == "mysql"
+                    and not mysql_ambiguous_escape_reported
+                    and index + 1 < len(query)
+                    and query[index + 1] == quote
+                ):
+                    add_finding(
+                        CODE["AMBIGUOUS_ESCAPE"],
+                        "MySQL backslash quote escaping depends on the NO_BACKSLASH_ESCAPES SQL mode",
+                        index,
+                        "\\" + quote,
+                    )
+                    mysql_ambiguous_escape_reported = True
                 index += 2
                 continue
             if character == quote:
@@ -309,9 +330,12 @@ def audit_sql_query(query: Any, *, dialect: Any = None, max_sql_length: Any = DE
             state = "single" if character == "'" else ("double" if character == '"' else "backtick")
             quote_start = index
             quote_kind = character
-            quote_backslash_escapes = selected == "mysql" or (
+            quote_backslash_escapes = (
+                selected == "mysql" and character in ("'", '"')
+            ) or (
                 selected == "postgres" and character == "'" and has_adjacent_postgres_escape_prefix(index)
             )
+            mysql_ambiguous_escape_reported = False
             index += 1
             continue
 
@@ -351,6 +375,12 @@ def audit_sql_query(query: Any, *, dialect: Any = None, max_sql_length: Any = DE
     if content_after_semicolon_index != -1:
         add_finding(CODE["MULTI_STATEMENT"], "SQL contains executable content after a statement terminator", content_after_semicolon_index)
 
+    last_program_token_by_statement = {}
+    for reverse_index in range(len(tokens) - 1, -1, -1):
+        reverse_statement = tokens[reverse_index][3]
+        if tokens[reverse_index][1] == "PROGRAM" and reverse_statement not in last_program_token_by_statement:
+            last_program_token_by_statement[reverse_statement] = reverse_index
+
     for token_index, token in enumerate(tokens):
         word, upper, token_start, token_statement = token
         if upper in _DANGEROUS_SINGLE_KEYWORDS:
@@ -368,33 +398,55 @@ def audit_sql_query(query: Any, *, dialect: Any = None, max_sql_length: Any = DE
             if upper == "BULK" and next_upper == "INSERT":
                 stats["dangerous_keywords"] += 1
                 add_finding(CODE["DANGEROUS_KEYWORD"], "SQL contains BULK INSERT syntax", token_start, "BULK INSERT")
-        if upper == "COPY":
-            for lookahead in range(token_index + 1, len(tokens)):
-                if tokens[lookahead][3] != token_statement:
-                    break
-                if tokens[lookahead][1] == "PROGRAM":
-                    stats["dangerous_keywords"] += 1
-                    add_finding(CODE["DANGEROUS_KEYWORD"], "SQL contains COPY ... PROGRAM command execution syntax", token_start, "COPY PROGRAM")
-                    break
+        program_token_index = last_program_token_by_statement.get(token_statement)
+        if upper == "COPY" and program_token_index is not None and program_token_index > token_index:
+            stats["dangerous_keywords"] += 1
+            add_finding(CODE["DANGEROUS_KEYWORD"], "SQL contains COPY ... PROGRAM command execution syntax", token_start, "COPY PROGRAM")
 
-    removed = [False] * len(query)
-    for start, end in removable_comment_spans:
-        for position in range(max(0, start), min(len(query), end)):
-            removed[position] = True
-    compact_characters = []
-    compact_map = []
-    for position, character in enumerate(query):
-        if not removed[position]:
-            compact_characters.append(character)
-            compact_map.append(position)
-    compact = "".join(compact_characters)
+    merged_comment_spans = []
+    for start, end in sorted(removable_comment_spans):
+        start = max(0, start)
+        end = min(len(query), end)
+        if end <= start:
+            continue
+        if merged_comment_spans and start <= merged_comment_spans[-1][1]:
+            if end > merged_comment_spans[-1][1]:
+                merged_comment_spans[-1] = (merged_comment_spans[-1][0], end)
+        else:
+            merged_comment_spans.append((start, end))
+
+    compact_parts = []
+    compact_segments = []
+    compact_length = 0
+    cursor = 0
+    for start, end in merged_comment_spans:
+        if start > cursor:
+            segment = query[cursor:start]
+            compact_parts.append(segment)
+            compact_segments.append((compact_length, cursor, len(segment)))
+            compact_length += len(segment)
+        cursor = max(cursor, end)
+    if cursor < len(query):
+        segment = query[cursor:]
+        compact_parts.append(segment)
+        compact_segments.append((compact_length, cursor, len(segment)))
+        compact_length += len(segment)
+    compact = "".join(compact_parts)
+    compact_segment_starts = [segment[0] for segment in compact_segments]
+
+    def original_position(compact_index: int) -> int:
+        segment_index = bisect.bisect_right(compact_segment_starts, compact_index) - 1
+        compact_start, source_start, _segment_length = compact_segments[segment_index]
+        return source_start + compact_index - compact_start
+
     for match in _WORD_RE.finditer(compact):
         upper = match.group(0).upper()
         if upper not in _DANGEROUS_SINGLE_KEYWORDS:
             continue
-        original_start = compact_map[match.start()]
-        original_end = compact_map[match.end() - 1]
-        if any(removed[position] for position in range(original_start, original_end + 1)):
+        original_start = original_position(match.start())
+        original_end = original_position(match.end() - 1)
+        compact_width = match.end() - match.start()
+        if original_end - original_start + 1 != compact_width:
             stats["dangerous_keywords"] += 1
             add_finding(
                 CODE["DANGEROUS_KEYWORD"],

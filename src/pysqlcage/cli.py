@@ -19,6 +19,12 @@ class _InputError(Exception):
     pass
 
 
+class _NeutralizingArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(2, _neutralize(self.prog) + ": error: " + _neutralize(message) + "\n")
+
+
 def _neutralize(text: Any) -> str:
     value = str(text)
     output = []
@@ -112,12 +118,12 @@ def _read_input(path: str) -> Tuple[str, str]:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _NeutralizingArgumentParser(
         prog="pysqlcage",
         description="Audit SQL text for injection-oriented lexical risk markers.",
     )
     parser.add_argument("--version", action="version", version="pysqlcage " + PYSQLCAGE_VERSION)
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True, parser_class=_NeutralizingArgumentParser)
     audit = subparsers.add_parser("audit", help="audit one SQL file or standard input")
     audit.add_argument("input", help="SQL file path, or - for standard input")
     audit.add_argument("--dialect", choices=("postgres", "mysql", "sqlite"), default="postgres")

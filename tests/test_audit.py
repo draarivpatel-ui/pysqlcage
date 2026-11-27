@@ -156,9 +156,10 @@ class AuditDialectLexingTest(unittest.TestCase):
         self.assertTrue(has_code(result, "DANGEROUS_KEYWORD"))
         self.assertFalse(has_code(result, "UNBALANCED_QUOTE"))
 
-    def test_mysql_string_uses_backslash_escape(self):
+    def test_mysql_backslash_quote_escape_is_mode_ambiguous(self):
         result = p.audit_sql_query("SELECT 'DROP\\' TABLE users'", dialect="mysql")
-        self.assertTrue(result.safe)
+        self.assertFalse(result.safe)
+        self.assertTrue(has_code(result, "AMBIGUOUS_ESCAPE"))
 
     def test_sqlite_string_does_not_use_backslash_escape(self):
         result = p.audit_sql_query("SELECT 'x\\' DROP TABLE users", dialect="sqlite")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -16,6 +17,19 @@ from .identifiers import assert_identifier, normalize_dialect, qualified_identif
 class _TableSpec:
     columns: Tuple[str, ...]
     sortable: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SchemaState:
+    dialect: str
+    tables: Tuple[str, ...]
+    specs: Any
+    max_columns: int
+    max_clauses: int
+    max_limit: Optional[int]
+
+
+_SCHEMA_DATA = weakref.WeakKeyDictionary()
 
 
 def _cap(name: str, value: Any, default: int, maximum: int, code: str) -> int:
@@ -73,15 +87,10 @@ def _normalize_table_spec(table_name: str, spec: Any) -> _TableSpec:
 class SchemaGuard:
     """Immutable table, column, sorting, pagination, SET, and VALUES allowlist."""
 
-    __slots__ = (
-        "_dialect",
-        "_tables",
-        "_specs",
-        "_max_columns",
-        "_max_clauses",
-        "_max_limit",
-        "_frozen",
-    )
+    __slots__ = ("__weakref__",)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise TypeError("SchemaGuard cannot be subclassed")
 
     def __init__(
         self,
@@ -120,69 +129,79 @@ class SchemaGuard:
             if type(max_limit) is not int or max_limit < 1:
                 fail(CODE["INVALID_SCHEMA"], "max_limit must be a positive integer")
             limit_cap = max_limit
-        object.__setattr__(self, "_dialect", selected)
-        object.__setattr__(self, "_tables", tuple(table_names))
-        object.__setattr__(self, "_specs", MappingProxyType(normalized))
-        object.__setattr__(self, "_max_columns", column_cap)
-        object.__setattr__(self, "_max_clauses", clause_cap)
-        object.__setattr__(self, "_max_limit", limit_cap)
-        object.__setattr__(self, "_frozen", True)
+        _SCHEMA_DATA[self] = _SchemaState(
+            dialect=selected,
+            tables=tuple(table_names),
+            specs=MappingProxyType(normalized),
+            max_columns=column_cap,
+            max_clauses=clause_cap,
+            max_limit=limit_cap,
+        )
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if getattr(self, "_frozen", False):
-            raise AttributeError("SchemaGuard is immutable")
-        object.__setattr__(self, name, value)
+        raise AttributeError("SchemaGuard is immutable")
+
+    def _state(self) -> _SchemaState:
+        try:
+            return _SCHEMA_DATA[self]
+        except KeyError:
+            fail(CODE["INVALID_SCHEMA"], "SchemaGuard instance is not initialized")
 
     def __delattr__(self, name: str) -> None:
         raise AttributeError("SchemaGuard is immutable")
 
     @property
     def dialect(self) -> str:
-        return self._dialect
+        return self._state().dialect
 
     @property
     def tables(self) -> Tuple[str, ...]:
-        return self._tables
+        return self._state().tables
 
     def _table_spec(self, table: Any) -> _TableSpec:
         assert_identifier(table, "table")
-        if table not in self._specs:
+        specs = self._state().specs
+        if table not in specs:
             fail(CODE["UNKNOWN_TABLE"], "table is not in the schema allowlist", {"table": table})
-        return self._specs[table]
+        return specs[table]
 
     def table(self, name: Any) -> Any:
         self._table_spec(name)
-        return static_fragment(quote_identifier(name, self._dialect))
+        return static_fragment(quote_identifier(name, self._state().dialect))
 
     def column(self, table: Any, column: Any) -> Any:
         spec = self._table_spec(table)
         assert_identifier(column, "column")
         if column not in spec.columns:
             fail(CODE["UNKNOWN_COLUMN"], "column is not in the table allowlist", {"table": table, "column": column})
-        return static_fragment(qualified_identifier(column, self._dialect, table))
+        return static_fragment(qualified_identifier(column, self._state().dialect, table))
 
     def columns(self, table: Any, columns: Any) -> Any:
         spec = self._table_spec(table)
-        return safe_columns(columns, spec.columns, dialect=self._dialect, table=table, max_columns=self._max_columns)
+        state = self._state()
+        return safe_columns(columns, spec.columns, dialect=state.dialect, table=table, max_columns=state.max_columns)
 
     def order_by(self, table: Any, clauses: Any) -> Any:
         spec = self._table_spec(table)
-        return safe_order_by(clauses, spec.sortable, dialect=self._dialect, table=table, max_clauses=self._max_clauses)
+        state = self._state()
+        return safe_order_by(clauses, spec.sortable, dialect=state.dialect, table=table, max_clauses=state.max_clauses)
 
     def limit_offset(self, limit: Any = None, offset: Any = 0, max_limit: Any = None) -> Any:
-        if self._max_limit is None:
+        configured_limit = self._state().max_limit
+        if configured_limit is None:
             effective = max_limit
         elif max_limit is None:
-            effective = self._max_limit
+            effective = configured_limit
         elif type(max_limit) is int and max_limit > 0:
-            effective = min(self._max_limit, max_limit)
+            effective = min(configured_limit, max_limit)
         else:
             effective = max_limit
         return safe_limit_offset(limit=limit, offset=offset, max_limit=effective)
 
     def set_clause(self, table: Any, patch: Any) -> Any:
         spec = self._table_spec(table)
-        return sql_set(patch, dialect=self._dialect, allowed_columns=spec.columns, max_columns=self._max_columns)
+        state = self._state()
+        return sql_set(patch, dialect=state.dialect, allowed_columns=spec.columns, max_columns=state.max_columns)
 
     def values_clause(self, table: Any, rows: Any, columns: Any = None) -> Any:
         spec = self._table_spec(table)
@@ -200,13 +219,16 @@ class SchemaGuard:
             assert_identifier(column, "VALUES column")
             if column not in spec.columns:
                 fail(CODE["UNKNOWN_COLUMN"], "VALUES column is not in the table allowlist", {"table": table, "column": column})
+        if type(rows) in (list, tuple) and rows and type(rows[0]) in (list, tuple) and len(rows[0]) != len(selected_columns):
+            fail(CODE["EMPTY_VALUES"], "VALUES sequence rows must exactly match the explicit column count")
         return sql_values(rows, columns=selected_columns, max_parameters=1000)
 
     def has_table(self, name: Any) -> bool:
-        return type(name) is str and name in self._specs
+        return type(name) is str and name in self._state().specs
 
     def has_column(self, table: Any, column: Any) -> bool:
-        return type(table) is str and type(column) is str and table in self._specs and column in self._specs[table].columns
+        specs = self._state().specs
+        return type(table) is str and type(column) is str and table in specs and column in specs[table].columns
 
     def columns_for(self, table: Any) -> Tuple[str, ...]:
         return self._table_spec(table).columns
