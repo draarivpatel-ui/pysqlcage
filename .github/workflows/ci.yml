@@ -36,7 +36,7 @@ jobs:
       - name: Install hash pinned build tooling
         run: python3 -m pip install --require-hashes -r .github/requirements-build.txt
       - name: Build source and wheel distributions
-        run: python3 -m build --no-isolation
+        run: python3 -m build
       - name: Verify distribution contents
         run: |
           python3 - <<'PY'
