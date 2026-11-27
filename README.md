@@ -22,6 +22,7 @@ python3 -m pip install pysqlcage
 
 - SQL template text passed to `sql_fragment` is trusted developer input, just like source code.
 - Values wrapped in `sql_param` are never interpolated into SQL text. They are returned separately in the driver parameter tuple.
+- Naive and timezone-aware `datetime` values are both accepted and passed to the driver unchanged. Applications remain responsible for their own timezone policy.
 - Table names, column names, ordering columns, and ordering directions cannot be parameterized by DB-API drivers. They are therefore validated against strict immutable allowlists.
 - `SqlFragment` objects are immutable, exact-class, token-branded objects. JSON objects, dictionaries, strings, pickled copies, and subclass impostors are not accepted as trusted SQL fragments.
 - The compiler fails closed with hard caps of 1000 parameters, 65536 SQL characters, and fragment nesting depth of 32.
@@ -115,6 +116,8 @@ assert compile_query(query, dialect="postgres", paramstyle="numeric") == (
 
 MySQL defaults to `%s`, and SQLite defaults to `?`. You can explicitly choose `qmark`, `format`, `pyformat`, or `numeric` where your driver requires one of those forms. In this library `format` and `pyformat` both emit `%s` because psycopg and common MySQL DB-API drivers accept that placeholder shape.
 
+Compiled SQL is driver input, not final raw SQL. When `format` or `pyformat` is selected, every literal percent sign in trusted static template text is escaped as `%%` so a static `'%s'` string literal or a modulo operator cannot be mistaken for a generated placeholder. Generated parameter placeholders remain `%s`. `qmark` and `numeric` SQL text is not percent-escaped because those parameter styles do not use printf interpolation.
+
 ## Schema allowlists
 
 `SchemaGuard` freezes a schema definition and rejects every unknown table, column, or sorting key:
@@ -179,6 +182,8 @@ printf 'SELECT 1; DROP TABLE users\n' | python3 -m pysqlcage audit - --dialect s
 
 Exit status is `0` when no findings are present, `1` when the SQL is unsafe, and `2` for input or operational errors. File input is opened with symlink, file-type, race, size, encoding, and control-character defenses.
 
+The MySQL lexer fails closed when a backslash immediately precedes a single or double quote because `NO_BACKSLASH_ESCAPES` changes where the string boundary lies. Such input is reported as `PYSQLCAGE_AMBIGUOUS_ESCAPE`. Backslashes never escape backtick-quoted MySQL identifiers.
+
 ## Python support and dependencies
 
 - Python 3.9 through 3.13
@@ -192,5 +197,7 @@ Exit status is `0` when no findings are present, `1` when the SQL is unsafe, and
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
+
+The standard library test suite currently runs 893 tests.
 
 Please read `CONTRIBUTING.md` before opening a pull request and `SECURITY.md` before reporting a vulnerability.

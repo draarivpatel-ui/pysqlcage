@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import weakref
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from types import MappingProxyType
@@ -23,6 +25,16 @@ _DEFAULT_PARAMSTYLE = {
     "mysql": "format",
     "sqlite": "qmark",
 }
+
+
+@dataclass(frozen=True)
+class _CageState:
+    settings: Mapping[str, Any]
+    options: Mapping[str, Any]
+    explicit_paramstyle: bool
+
+
+_CAGE_DATA = weakref.WeakKeyDictionary()
 
 
 def normalize_paramstyle(paramstyle: Any, dialect: str) -> str:
@@ -144,8 +156,53 @@ def compile_query(
     return _compile_with_settings(fragment, settings)
 
 
+def _analyze_fragment_shape(root: Any, max_fragment_depth: int) -> Tuple[Dict[Any, bool], Dict[Any, int]]:
+    empty_status: Dict[Any, bool] = {}
+    height_status: Dict[Any, int] = {}
+    stack = [(root, 0)]
+    while stack:
+        fragment, path_depth = stack[-1]
+        if path_depth > max_fragment_depth:
+            fail(
+                CODE["MAX_FRAGMENT_DEPTH"],
+                "SQL fragment nesting exceeds max_fragment_depth (" + str(max_fragment_depth) + ")",
+            )
+        if fragment in empty_status:
+            stack.pop()
+            continue
+        children = []
+        has_parameter = False
+        for value in fragment.values:
+            if is_sql_fragment(value):
+                children.append(value)
+            else:
+                has_parameter = True
+        unresolved = [child for child in children if child not in empty_status]
+        if unresolved:
+            stack.extend((child, path_depth + 1) for child in unresolved)
+            continue
+        empty_status[fragment] = (
+            not has_parameter
+            and all(text == "" for text in fragment.strings)
+            and all(empty_status[child] for child in children)
+        )
+        height = 0
+        for child in children:
+            height = max(height, height_status[child] + 1)
+        height_status[fragment] = height
+        stack.pop()
+    return empty_status, height_status
+
+
 def _compile_with_settings(fragment: Any, settings: Mapping[str, Any]) -> Tuple[str, Tuple[Any, ...]]:
     root = assert_fragment(fragment, "query")
+    empty_fragments, fragment_heights = _analyze_fragment_shape(root, settings["max_fragment_depth"])
+    if fragment_heights[root] > settings["max_fragment_depth"]:
+        fail(
+            CODE["MAX_FRAGMENT_DEPTH"],
+            "SQL fragment nesting exceeds max_fragment_depth (" + str(settings["max_fragment_depth"]) + ")",
+        )
+    escape_literal_percent = settings["paramstyle"] in ("format", "pyformat")
     sql_parts = []
     values = []
     sql_length = 0
@@ -168,6 +225,8 @@ def _compile_with_settings(fragment: Any, settings: Mapping[str, Any]) -> Tuple[
     while stack:
         event_type, payload, depth = stack.pop()
         if event_type == "text":
+            if escape_literal_percent:
+                payload = payload.replace("%", "%%")
             append_sql(payload)
             continue
         if event_type == "parameter":
@@ -183,7 +242,8 @@ def _compile_with_settings(fragment: Any, settings: Mapping[str, Any]) -> Tuple[
         sequence = [("text", data_strings[0], depth)]
         for index, value in enumerate(data_values):
             if is_sql_fragment(value):
-                sequence.append(("fragment", value, depth + 1))
+                if not empty_fragments[value]:
+                    sequence.append(("fragment", value, depth + 1))
             else:
                 sequence.append(("parameter", value, depth))
             sequence.append(("text", data_strings[index + 1], depth))
@@ -196,7 +256,10 @@ def _compile_with_settings(fragment: Any, settings: Mapping[str, Any]) -> Tuple[
 class SqlCage:
     """Reusable dialect-specific compiler factory."""
 
-    __slots__ = ("_settings", "_options", "_explicit_paramstyle", "_frozen")
+    __slots__ = ("__weakref__",)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise TypeError("SqlCage cannot be subclassed")
 
     def __init__(
         self,
@@ -220,38 +283,45 @@ class SqlCage:
             allow_callables=allow_callables,
             allow_non_finite=allow_non_finite,
         )
-        object.__setattr__(self, "_settings", settings)
-        object.__setattr__(self, "_options", MappingProxyType(dict(settings)))
-        object.__setattr__(self, "_explicit_paramstyle", paramstyle is not None)
-        object.__setattr__(self, "_frozen", True)
+        frozen_settings = MappingProxyType(dict(settings))
+        _CAGE_DATA[self] = _CageState(
+            settings=frozen_settings,
+            options=MappingProxyType(dict(settings)),
+            explicit_paramstyle=paramstyle is not None,
+        )
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if getattr(self, "_frozen", False):
-            raise AttributeError("SqlCage is immutable")
-        object.__setattr__(self, name, value)
+        raise AttributeError("SqlCage is immutable")
+
+    def _state(self) -> _CageState:
+        try:
+            return _CAGE_DATA[self]
+        except KeyError:
+            fail(CODE["INVALID_OPTIONS"], "SqlCage instance is not initialized")
 
     def __delattr__(self, name: str) -> None:
         raise AttributeError("SqlCage is immutable")
 
     @property
     def dialect(self) -> str:
-        return self._settings["dialect"]
+        return self._state().settings["dialect"]
 
     @property
     def paramstyle(self) -> str:
-        return self._settings["paramstyle"]
+        return self._state().settings["paramstyle"]
 
     @property
     def options(self) -> Mapping[str, Any]:
-        return self._options
+        return self._state().options
 
     def compile(self, fragment: Any, **overrides: Any) -> Tuple[str, Tuple[Any, ...]]:
-        unknown = sorted(set(overrides) - set(self._settings))
+        state = self._state()
+        unknown = sorted(set(overrides) - set(state.settings))
         if unknown:
             fail(CODE["INVALID_OPTIONS"], "unknown compile override " + unknown[0])
-        settings = dict(self._settings)
+        settings = dict(state.settings)
         settings.update(overrides)
-        if not self._explicit_paramstyle and "paramstyle" not in overrides:
+        if not state.explicit_paramstyle and "paramstyle" not in overrides:
             settings["paramstyle"] = None
         normalized = _compile_settings(**settings)
         return _compile_with_settings(fragment, normalized)
