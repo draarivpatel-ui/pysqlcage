@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run unit tests
+        run: PYTHONPATH=src python3 -m unittest discover -s tests
+      - name: Run CLI smoke tests
+        run: |
+          printf 'SELECT 1\n' | PYTHONPATH=src python3 -m pysqlcage audit - --dialect sqlite --json
+          printf 'SELECT 1; DROP TABLE users\n' | PYTHONPATH=src python3 -m pysqlcage audit - --dialect sqlite --json && exit 1 || test $? -eq 1
+          PYTHONPATH=src python3 -m pysqlcage --version
+      - name: Install build tooling
+        run: python3 -m pip install build
+      - name: Build source and wheel distributions
+        run: python3 -m build
+      - name: Verify distribution contents
+        run: |
+          python3 - <<'PY'
+          import glob
+          import tarfile
+          import zipfile
+
+          wheels = glob.glob('dist/*.whl')
+          sdists = glob.glob('dist/*.tar.gz')
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              names = wheel.namelist()
+              assert 'pysqlcage/py.typed' in names
+              assert not any(name.startswith('tests/') or '/tests/' in name for name in names)
+              assert not any(name.endswith(('.pyc', '.pyo')) or '__pycache__' in name for name in names)
+          with tarfile.open(sdists[0]) as sdist:
+              names = sdist.getnames()
+              assert any(name.endswith('/pysqlcage/py.typed') for name in names)
+              assert not any('__pycache__' in name or name.endswith(('.pyc', '.pyo')) for name in names)
+          print('distribution contents verified')
+          PY
